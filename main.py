@@ -12,7 +12,7 @@ def hello_world():
     # proccesing code
     return "Hello, World!"  # Esta línea debe estar indentada
 
-@app.route("/predict", methods=["POST"])
+@app.route("/predict", methods=['GET', 'POST'])
 def predict():
     if request.method == "POST":
         data = request.json
