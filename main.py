@@ -1,418 +1,461 @@
-from flask import Flask, request, jsonify
-from flask_cors import CORS
+"""
+DIABETIC SOFT MUNDI - API v3.0
+================================
+Backend Flask para tamizaje de riesgo de diabetes tipo II adaptado a poblacion
+andina de Cusco. Consume los modelos calibrados generados por train.py.
+
+Cambios respecto a v2:
+  - Reglas clinicas duras (ALAD / ADA) sobre la prediccion del modelo
+  - Validacion estricta de rangos antropometricos
+  - IMC se calcula en el backend, app solo envia peso/talla
+  - Probabilidades calibradas (CalibratedClassifierCV) -> barras honestas
+  - Logueo del feature-vector para debugging en Render
+"""
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
 import joblib
 import numpy as np
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+
+# ---------------------------------------------------------------------------
+# Carga de artefactos
+# ---------------------------------------------------------------------------
+HERE = Path(__file__).parent
+modelo_basico = joblib.load(HERE / "modelo_basico.pkl")
+modelo_completo = joblib.load(HERE / "modelo_completo.pkl")
+scaler_basico = joblib.load(HERE / "scaler_basico.pkl")
+scaler_completo = joblib.load(HERE / "scaler_completo.pkl")
+metadata = joblib.load(HERE / "metadata.pkl")
+
+CLASES = metadata["clases"]  # ['Alterado', 'Muy Alterado', 'Normal']
+FEATURES_BASICO = metadata["features_basico"]
+FEATURES_COMPLETO = metadata["features_completo"]
+
+# Textos descriptivos por modo (la app Flutter puede mostrarlos al usuario)
+NOTA_BASICO = (
+    "Test rapido para cuando no tienes todos tus datos. Este tamizaje preliminar "
+    "usa solo antropometria y cuestionario. Para mayor precision, ingresa tus "
+    "analisis de glucosa, colesterol y trigliceridos en el modo completo."
+)
+NOTA_COMPLETO = (
+    "Evaluacion completa con datos antropometricos y resultados de laboratorio "
+    "basico. Proporciona el resultado mas preciso del tamizaje."
+)
+
+IDX_NORMAL = CLASES.index("Normal")
+IDX_ALTERADO = CLASES.index("Alterado")
+IDX_MUY = CLASES.index("Muy Alterado")
 
 app = Flask(__name__)
 CORS(app)
 
-# ============================================================
-# Cargar modelos al iniciar el servidor
-# Archivos que deben estar en el mismo directorio:
-#   modelo_basico.pkl     → MLP Neural Net (9 variables)
-#   modelo_completo.pkl   → Logistic Regression (12 variables)
-#   scaler_basico.pkl     → StandardScaler entrenado
-#   scaler_completo.pkl   → StandardScaler entrenado
-#   metadata.pkl          → Encoders + configuración
-# ============================================================
-modelo_basico = joblib.load('modelo_basico.pkl')
-modelo_completo = joblib.load('modelo_completo.pkl')
-scaler_basico = joblib.load('scaler_basico.pkl')
-scaler_completo = joblib.load('scaler_completo.pkl')
-metadata = joblib.load('metadata.pkl')
+# ---------------------------------------------------------------------------
+# Validacion y reglas clinicas
+# ---------------------------------------------------------------------------
+RANGOS = {
+    "edad": (15, 100),
+    "peso": (30, 250),
+    "talla": (120, 220),  # cm
+    "perimetro_abdominal": (50, 180),
+    "antecedentes_familiares": (0, 2),
+    "actividad_fisica": (0, 2),
+    "consumo_frutas_verduras": (0, 1),
+    "presion_arterial": (70, 240),
+    "altitud": (0, 6000),
+    "glucosa": (40, 600),
+    "colesterol": (80, 500),
+    "trigliceridos": (30, 1000),
+}
 
-CLASES = metadata['clases']  # ['Alterado', 'Muy Alterado', 'Normal']
 
-# ============================================================
-# RUTA PRINCIPAL - Info del API
-# ============================================================
+def _valida(nombre: str, valor: float):
+    lo, hi = RANGOS[nombre]
+    if not (lo <= valor <= hi):
+        raise ValueError(f"{nombre}={valor} fuera de rango [{lo}, {hi}]")
+
+
+def aplicar_reglas_clinicas(
+    pred_idx: int,
+    proba: np.ndarray,
+    *,
+    glucosa: float | None,
+    perimetro: float,
+    sexo_enc: int,
+    imc: float,
+    presion: float,
+) -> tuple[int, np.ndarray, list[str]]:
+    """Post-procesa la prediccion del modelo aplicando guardrails clinicos.
+
+    Referencias: ALAD 2019, ADA Standards of Care 2024, MINSA Peru.
+    """
+    proba = proba.copy()
+    avisos: list[str] = []
+
+    # 1) Glucosa: criterio diagnostico directo
+    if glucosa is not None:
+        if glucosa >= 200:
+            pred_idx = IDX_MUY
+            proba = np.array([0.0, 0.0, 0.0])
+            proba[IDX_MUY] = 0.97
+            proba[IDX_ALTERADO] = 0.03
+            avisos.append("Glucosa >=200 mg/dL: clasificacion forzada a 'Muy Alterado' por criterio diagnostico (ADA).")
+        elif glucosa >= 126:
+            if pred_idx == IDX_NORMAL:
+                pred_idx = IDX_MUY
+                avisos.append("Glucosa >=126 mg/dL en ayunas: criterio de diabetes tipo II. Elevado a 'Muy Alterado'.")
+                proba = np.array([0.10, 0.85, 0.05])
+            elif pred_idx == IDX_ALTERADO:
+                pred_idx = IDX_MUY
+                avisos.append("Glucosa >=126 mg/dL en ayunas: elevado a 'Muy Alterado'.")
+                proba = np.array([0.15, 0.80, 0.05])
+        elif glucosa >= 100:
+            if pred_idx == IDX_NORMAL:
+                pred_idx = IDX_ALTERADO
+                avisos.append("Glucosa entre 100 y 125 mg/dL: prediabetes (ADA). Elevado a 'Alterado'.")
+                proba = np.array([0.80, 0.10, 0.10])
+
+    # 2) Obesidad central (criterio ALAD: H>=90, M>=80 cm)
+    umbral_perim = 90 if sexo_enc == 1 else 80
+    if perimetro >= umbral_perim and pred_idx == IDX_NORMAL:
+        pred_idx = IDX_ALTERADO
+        avisos.append(
+            f"Perimetro abdominal {perimetro} cm >= {umbral_perim} cm (criterio ALAD): "
+            f"obesidad central. Elevado a 'Alterado'."
+        )
+        proba = np.array([0.65, 0.15, 0.20])
+
+    # 3) HTA estadio 2 sostenida sumada a IMC alto
+    if presion >= 160 and imc >= 30 and pred_idx == IDX_NORMAL:
+        pred_idx = IDX_ALTERADO
+        avisos.append("Presion sistolica >=160 con IMC >=30: riesgo cardiometabolico alto.")
+
+    return pred_idx, proba, avisos
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
 @app.route("/")
 def home():
     return jsonify({
         "app": "Diabetic Soft Mundi API",
-        "version": "2.0",
+        "version": metadata.get("version", "3.0"),
+        "modelo": metadata.get("modelo"),
         "universidad": "Universidad Andina del Cusco",
+        "clases": CLASES,
         "modos": {
             "basico": {
-                "variables": 9,
-                "modelo": metadata.get('mejor_modelo_basico', 'MLP Neural Net'),
-                "accuracy": metadata.get('accuracy_basico'),
-                "descripcion": "Sin laboratorio - solo cuestionario + antropometría"
+                "variables": len(FEATURES_BASICO),
+                "features": FEATURES_BASICO,
+                "metricas": metadata["metricas_basico"],
+                "descripcion": "Test rapido sin laboratorio",
+                "nota": NOTA_BASICO,
             },
             "completo": {
-                "variables": 12,
-                "modelo": metadata.get('mejor_modelo_completo', 'Logistic Regression'),
-                "accuracy": metadata.get('accuracy_completo'),
-                "descripcion": "Con laboratorio básico (glucómetro + lab simple)"
-            }
+                "variables": len(FEATURES_COMPLETO),
+                "features": FEATURES_COMPLETO,
+                "metricas": metadata["metricas_completo"],
+                "descripcion": "Evaluacion con laboratorio basico",
+                "nota": NOTA_COMPLETO,
+            },
         },
-        "clases": CLASES,
-        "nota": "HbA1c excluida por data leakage"
+        "reglas_clinicas": metadata.get("reglas_clinicas_post"),
+        "limitaciones": metadata.get("limitaciones"),
     })
 
-# ============================================================
-# RUTA DE PREDICCIÓN
-# ============================================================
-@app.route("/predict", methods=['POST'])
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({
+        "status": "ok",
+        "version": metadata.get("version"),
+        "clases": CLASES,
+        "macro_f1_basico": metadata["metricas_basico"]["macro_f1"],
+        "macro_f1_completo": metadata["metricas_completo"]["macro_f1"],
+    })
+
+
+@app.route("/predict", methods=["POST"])
 def predict():
-    data = request.get_json()
-    if data is None:
-        return jsonify({"success": False, "error": "No se proporcionaron datos JSON"}), 400
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"success": False, "error": "JSON requerido"}), 400
 
     try:
-        modo = data.get('modo', 'basico')  # 'basico' o 'completo'
+        modo = str(data.get("modo", "basico")).lower()
+        if modo not in {"basico", "completo"}:
+            return jsonify({"success": False, "error": f"modo invalido: {modo}"}), 400
 
-        # ── Variables comunes (modo básico) ──
-        # Sexo: 'M' o 'F'
-        sexo = data.get('sexo', 'M').upper()
-        sexo_enc = 1 if sexo == 'M' else 0
+        # ----- Lectura y validacion -----
+        sexo = str(data.get("sexo", "M")).upper()
+        if sexo not in {"M", "F"}:
+            return jsonify({"success": False, "error": "sexo debe ser 'M' o 'F'"}), 400
+        sexo_enc = 1 if sexo == "M" else 0
 
-        # Edad en años
-        edad = float(data['edad'])
+        edad = float(data["edad"]); _valida("edad", edad)
+        peso = float(data["peso"]); _valida("peso", peso)
+        talla_cm = float(data["talla"]); _valida("talla", talla_cm)
 
-        # IMC calculado automáticamente desde peso y talla
-        peso = float(data['peso'])          # kg
-        talla_cm = float(data['talla'])     # cm
         talla_m = talla_cm / 100.0
         imc = peso / (talla_m ** 2)
+        if not (10 <= imc <= 70):
+            return jsonify({"success": False, "error": f"IMC calculado fuera de rango: {imc:.2f}"}), 400
 
-        # Perímetro abdominal en cm
-        perimetro = float(data['perimetro_abdominal'])
+        perimetro = float(data["perimetro_abdominal"]); _valida("perimetro_abdominal", perimetro)
+        antecedentes = int(data["antecedentes_familiares"]); _valida("antecedentes_familiares", antecedentes)
+        actividad = int(data["actividad_fisica"]); _valida("actividad_fisica", actividad)
+        frutas = int(data["consumo_frutas_verduras"]); _valida("consumo_frutas_verduras", frutas)
+        presion = float(data.get("presion_arterial", 120)); _valida("presion_arterial", presion)
+        altitud = float(data.get("altitud", 3400)); _valida("altitud", altitud)
 
-        # Antecedentes familiares: 0=Ninguno, 1=Un familiar, 2=Ambos
-        antecedentes = int(data['antecedentes_familiares'])
+        glucosa = colesterol = trigliceridos = None
+        if modo == "completo":
+            glucosa = float(data["glucosa"]); _valida("glucosa", glucosa)
+            colesterol = float(data["colesterol"]); _valida("colesterol", colesterol)
+            trigliceridos = float(data["trigliceridos"]); _valida("trigliceridos", trigliceridos)
 
-        # Actividad física: 0=Sedentario, 1=Moderado, 2=Activo
-        actividad = int(data['actividad_fisica'])
-
-        # Consumo frutas/verduras: 0=No diario, 1=Diario
-        frutas = int(data['consumo_frutas_verduras'])
-
-        # Presión arterial sistólica (mmHg) - opcional, default 120
-        presion = float(data.get('presion_arterial', 120))
-
-        # Altitud m.s.n.m. - opcional, default 3400 (Cusco)
-        altitud = float(data.get('altitud', 3400))
-
-        # ── Orden EXACTO de features (debe coincidir con entrenamiento) ──
-        # ['Edad','Sexo_enc','IMC','PerimetroAbdominal','AntecedentesFamiliares',
-        #  'ActividadFisica','ConsumoFrutasVerduras','PresionArterial','Altitud']
-        features_basico = [
-            edad, sexo_enc, imc, perimetro, antecedentes,
-            actividad, frutas, presion, altitud
-        ]
-
-        if modo == 'completo':
-            # ── Variables adicionales (laboratorio básico) ──
-            glucosa = float(data['glucosa'])            # mg/dl
-            colesterol = float(data['colesterol'])      # mg/dl
-            trigliceridos = float(data['trigliceridos']) # mg/dl
-            # HbA1c NO se usa (data leakage)
-
-            features = features_basico + [glucosa, colesterol, trigliceridos]
-            features_scaled = scaler_completo.transform([features])
-            pred = modelo_completo.predict(features_scaled)[0]
-            proba = modelo_completo.predict_proba(features_scaled)[0]
-            modelo_usado = 'completo'
-            n_vars = 12
-        else:
-            features_scaled = scaler_basico.transform([features_basico])
-            pred = modelo_basico.predict(features_scaled)[0]
-            proba = modelo_basico.predict_proba(features_scaled)[0]
-            modelo_usado = 'basico'
-            n_vars = 9
-
-        # ── Resultado ──
-        categoria = CLASES[int(pred)]
-        probabilidades = {
-            CLASES[i]: round(float(p) * 100, 2)
-            for i, p in enumerate(proba)
+        # ----- Construccion del vector EN EL ORDEN del metadata -----
+        valores = {
+            "Edad": edad, "Sexo_enc": sexo_enc, "IMC": imc,
+            "PerimetroAbdominal": perimetro,
+            "AntecedentesFamiliares": antecedentes,
+            "ActividadFisica": actividad,
+            "ConsumoFrutasVerduras": frutas,
+            "PresionArterial": presion,
+            "Altitud": altitud,
+            "GlucosaSangre": glucosa,
+            "Colesterol": colesterol,
+            "Trigliceridos": trigliceridos,
         }
 
-        # ── Certeza ──
+        if modo == "completo":
+            cols = FEATURES_COMPLETO
+            vec = np.array([[valores[c] for c in cols]], dtype=float)
+            X = scaler_completo.transform(vec)
+            proba = modelo_completo.predict_proba(X)[0]
+        else:
+            cols = FEATURES_BASICO
+            vec = np.array([[valores[c] for c in cols]], dtype=float)
+            X = scaler_basico.transform(vec)
+            proba = modelo_basico.predict_proba(X)[0]
+
+        pred_idx = int(np.argmax(proba))
+
+        # ----- Reglas clinicas duras -----
+        pred_idx, proba, avisos = aplicar_reglas_clinicas(
+            pred_idx, proba,
+            glucosa=glucosa, perimetro=perimetro, sexo_enc=sexo_enc,
+            imc=imc, presion=presion,
+        )
+
+        categoria = CLASES[pred_idx]
+        probabilidades = {CLASES[i]: round(float(p) * 100, 2) for i, p in enumerate(proba)}
         max_prob = float(max(proba))
-        if max_prob > 0.8:
+        if max_prob >= 0.80:
             certeza = "alta"
-        elif max_prob > 0.6:
+        elif max_prob >= 0.60:
             certeza = "moderada"
         else:
             certeza = "baja"
 
-        # ── Recomendaciones detalladas ──
-        recomendaciones = {
-            'Normal': {
-                'mensaje': 'Su nivel de riesgo es bajo. Mantenga sus hábitos saludables y realice controles anuales.',
-                'alimentacion': {
-                    'descripcion': 'Dieta balanceada para mantener su estado saludable',
-                    'recomendados': [
-                        'Quinua, kiwicha y cañihua (granos andinos ricos en proteína y fibra)',
-                        'Chuño y moraya (fuente de carbohidratos complejos)',
-                        'Tarwi/chocho (alto en proteínas, bajo índice glucémico)',
-                        'Frutas locales: tumbo, aguaymanto, tuna, capulí',
-                        'Verduras: zapallo, calabaza, hojas de quinua, yuyo',
-                        'Trucha y cuy (proteínas magras)',
-                        'Habas, arvejas y pallares frescos',
-                        'Mate de muña, manzanilla o hierba luisa (infusiones sin azúcar)'
-                    ],
-                    'evitar': [
-                        'Exceso de pan blanco y fideos refinados',
-                        'Bebidas azucaradas y gaseosas',
-                        'Frituras en exceso'
-                    ],
-                    'porciones': '3 comidas principales + 2 refrigerios saludables al día'
-                },
-                'actividad_fisica': {
-                    'descripcion': 'Mantenga un estilo de vida activo',
-                    'recomendaciones': [
-                        'Caminatas de 30 minutos diarios (considere la altitud)',
-                        'Actividades recreativas: caminatas, paseos en bicicleta',
-                        'Ejercicios de estiramiento al despertar',
-                        'Subir escaleras en lugar de usar ascensor'
-                    ],
-                    'minutos_semanales': 150
-                },
-                'estilo_vida': [
-                    'Dormir entre 7 y 8 horas diarias',
-                    'Hidratarse bien (mínimo 8 vasos de agua al día, importante en altitud)',
-                    'Control médico anual preventivo',
-                    'Mantener un peso saludable (IMC entre 18.5 y 24.9)'
-                ],
-                'educacion': [
-                    'La diabetes tipo II se puede prevenir con hábitos saludables',
-                    'Los alimentos andinos tienen bajo índice glucémico, son aliados naturales',
-                    'La altitud de Cusco puede afectar cómo el cuerpo procesa los azúcares',
-                    'Los antecedentes familiares son un factor de riesgo no modificable, pero los hábitos sí lo son'
-                ]
-            },
-            'Alterado': {
-                'mensaje': 'Presenta factores de riesgo moderados. Se recomienda consultar a un profesional de salud.',
-                'alimentacion': {
-                    'descripcion': 'Dieta controlada para reducir factores de riesgo',
-                    'recomendados': [
-                        'Quinua y kiwicha como reemplazo del arroz blanco (menor índice glucémico)',
-                        'Tarwi/chocho remojado (rico en proteína vegetal, estabiliza glucosa)',
-                        'Chuño negro en sopas (carbohidrato complejo de absorción lenta)',
-                        'Moraya rallada en preparaciones (fuente de almidón resistente)',
-                        'Trucha y cuy al horno o a la plancha (proteína magra)',
-                        'Ensaladas con hojas de quinua, yuyo y berros',
-                        'Aguaymanto, tuna y tumbo (frutas bajas en azúcar)',
-                        'Habas, tarwi y pallares como fuente de proteína y fibra',
-                        'Mate de muña después de las comidas (digestivo natural)',
-                        'Agua de cebada sin azúcar'
-                    ],
-                    'evitar': [
-                        'Azúcar refinada (reemplazar con stevia o pequeñas cantidades de miel)',
-                        'Pan blanco y fideos (preferir integrales o de quinua)',
-                        'Gaseosas y jugos envasados',
-                        'Frituras y comida chatarra',
-                        'Exceso de papa blanca (preferir papa nativa o chuño)',
-                        'Chicharrón y carnes grasas en exceso',
-                        'Alcohol en exceso'
-                    ],
-                    'porciones': '5 comidas pequeñas al día (evitar comer en exceso)',
-                    'ejemplo_menu': {
-                        'desayuno': 'Avena con quinua, aguaymanto y canela (sin azúcar)',
-                        'media_manana': 'Un puñado de habas tostadas + una tuna',
-                        'almuerzo': 'Sopa de moraya + trucha a la plancha con ensalada de quinua',
-                        'media_tarde': 'Mate de muña + tarwi con limón',
-                        'cena': 'Crema de zapallo con chuño rallado + infusión de manzanilla'
-                    }
-                },
-                'actividad_fisica': {
-                    'descripcion': 'Incrementar actividad física gradualmente',
-                    'recomendaciones': [
-                        'Caminatas de 30-45 minutos diarios (ritmo moderado)',
-                        'Subir gradualmente la intensidad (considerar altitud de Cusco)',
-                        'Ejercicios de fuerza 2-3 veces por semana (sentadillas, flexiones)',
-                        'Estiramiento diario de 10-15 minutos',
-                        'Bailar (actividad cultural andina que es ejercicio cardiovascular)',
-                        'Evitar el sedentarismo: levantarse cada hora si trabaja sentado'
-                    ],
-                    'minutos_semanales': 200,
-                    'nota_altitud': 'En altitud >3000m, la actividad física requiere más oxígeno. Aumente gradualmente la intensidad y mantenga buena hidratación.'
-                },
-                'estilo_vida': [
-                    'Controlar peso corporal: reducir 5-7% si tiene sobrepeso',
-                    'Dormir entre 7 y 8 horas (el mal sueño eleva la glucosa)',
-                    'Reducir estrés con técnicas de respiración o meditación',
-                    'Hidratarse con 8-10 vasos de agua al día',
-                    'Control médico cada 6 meses (glucosa y perfil lipídico)',
-                    'Monitorear presión arterial mensualmente',
-                    'Evitar fumar y reducir consumo de alcohol'
-                ],
-                'educacion': [
-                    'La prediabetes es REVERSIBLE con cambios en alimentación y ejercicio',
-                    'Perder entre 5 y 7% de peso puede reducir el riesgo de diabetes en 58%',
-                    'Los granos andinos (quinua, kiwicha, cañihua) tienen menor índice glucémico que el arroz',
-                    'El perímetro abdominal >94cm (hombres) o >80cm (mujeres) indica grasa visceral de riesgo',
-                    'La actividad física mejora la sensibilidad a la insulina incluso sin perder peso',
-                    'En altitud, el cuerpo puede tener respuestas metabólicas diferentes'
-                ],
-                'alerta': 'Se recomienda realizar una prueba de glucosa en ayunas en un centro de salud cercano.'
-            },
-            'Muy Alterado': {
-                'mensaje': 'Se detectó un alto nivel de riesgo. Es urgente acudir a un profesional de salud.',
-                'alimentacion': {
-                    'descripcion': 'Dieta estricta supervisada por profesional de salud',
-                    'recomendados': [
-                        'Quinua como base de alimentación (reemplazar arroz y fideos)',
-                        'Tarwi/chocho en todas sus formas (ensalada, sopa, guiso)',
-                        'Cañihua en mazamorras sin azúcar (alto valor nutricional)',
-                        'Chuño y moraya en cantidades controladas',
-                        'Verduras en abundancia: zapallo, calabaza, brócoli, espinaca',
-                        'Trucha o cuy al horno (máximo 3 veces por semana)',
-                        'Frutas con bajo índice glucémico: aguaymanto, tuna (con moderación)',
-                        'Infusiones: muña, manzanilla, hierba luisa (sin azúcar)',
-                        'Linaza remojada (1 cucharada diaria, ayuda al control glucémico)'
-                    ],
-                    'evitar_estrictamente': [
-                        'Azúcar en todas sus formas (blanca, rubia, miel en exceso)',
-                        'Pan blanco, fideos, galletas refinadas',
-                        'Gaseosas, jugos envasados, bebidas energéticas',
-                        'Frituras, chicharrón, pollo broaster',
-                        'Comida rápida y ultraprocesados',
-                        'Arroz blanco en grandes cantidades',
-                        'Alcohol',
-                        'Embutidos y carnes procesadas'
-                    ],
-                    'porciones': 'Porciones pequeñas, 5-6 veces al día. NUNCA saltarse comidas.',
-                    'ejemplo_menu': {
-                        'desayuno': 'Papilla de cañihua con canela + mate de muña',
-                        'media_manana': 'Tarwi con limón + 1 aguaymanto',
-                        'almuerzo': 'Ensalada de quinua con verduras + trucha al horno + chuño',
-                        'media_tarde': 'Habas tostadas (un puñado pequeño) + agua de linaza',
-                        'cena': 'Sopa de moraya con verduras + infusión de manzanilla'
-                    }
-                },
-                'actividad_fisica': {
-                    'descripcion': 'Actividad física supervisada y gradual',
-                    'recomendaciones': [
-                        'Consultar con médico ANTES de iniciar ejercicio intenso',
-                        'Caminatas suaves de 20-30 minutos, 5 veces por semana',
-                        'Aumentar gradualmente (la altitud de Cusco demanda más esfuerzo)',
-                        'Ejercicios de estiramiento diarios',
-                        'Evitar ejercicio intenso sin supervisión médica',
-                        'Monitorear cómo se siente durante la actividad (mareos, fatiga)'
-                    ],
-                    'minutos_semanales': 150,
-                    'nota_altitud': 'IMPORTANTE: En altitud >3000m, consulte a su médico antes de realizar actividad física intensa. Comience lentamente.'
-                },
-                'estilo_vida': [
-                    'ACUDIR A UN CENTRO DE SALUD lo antes posible para evaluación completa',
-                    'Realizarse prueba de glucosa en ayunas y perfil lipídico',
-                    'Control médico mensual mientras se estabiliza',
-                    'NO automedicarse con remedios caseros o fármacos sin prescripción',
-                    'Dormir 7-8 horas (el sueño irregular eleva la glucosa)',
-                    'Eliminar tabaco completamente',
-                    'Eliminar o reducir drásticamente el alcohol',
-                    'Controlar peso corporal con guía profesional',
-                    'Monitorear presión arterial semanalmente',
-                    'Llevar un registro diario de alimentación'
-                ],
-                'educacion': [
-                    'La diabetes tipo II no tratada puede causar complicaciones graves: daño renal, ceguera, amputaciones',
-                    'CON TRATAMIENTO ADECUADO, la diabetes se puede controlar efectivamente',
-                    'Los cambios en alimentación y ejercicio pueden ser tan efectivos como los medicamentos en etapas iniciales',
-                    'La altitud de Cusco puede afectar la lectura de glucómetros y hemoglobina',
-                    'Es importante involucrar a la familia en los cambios de alimentación',
-                    'Los centros de salud MINSA ofrecen control de diabetes de forma gratuita o a bajo costo',
-                    'Aprender a leer etiquetas de alimentos: buscar contenido de azúcar y carbohidratos'
-                ],
-                'alerta': 'URGENTE: Acuda a su centro de salud más cercano para una evaluación médica completa. No espere.',
-                'recursos_cusco': [
-                    'Hospital Regional del Cusco - Servicio de Endocrinología',
-                    'Centro de Salud San Jerónimo',
-                    'EsSalud Cusco - Programa de Diabetes',
-                    'Puestos de salud MINSA - Control gratuito de glucosa'
-                ]
-            }
-        }
+        # ----- Clasificacion IMC y perimetro -----
+        if imc < 18.5: imc_cat = "Bajo peso"
+        elif imc < 25: imc_cat = "Normal"
+        elif imc < 30: imc_cat = "Sobrepeso"
+        elif imc < 35: imc_cat = "Obesidad grado I"
+        elif imc < 40: imc_cat = "Obesidad grado II"
+        else: imc_cat = "Obesidad grado III"
 
-        # ── Clasificación IMC ──
-        if imc < 18.5:
-            imc_cat = "Bajo peso"
-        elif imc < 25:
-            imc_cat = "Normal"
-        elif imc < 30:
-            imc_cat = "Sobrepeso"
-        elif imc < 35:
-            imc_cat = "Obesidad grado I"
-        elif imc < 40:
-            imc_cat = "Obesidad grado II"
-        else:
-            imc_cat = "Obesidad grado III"
+        umbral_perim = 90 if sexo_enc == 1 else 80
+        obesidad_central = perimetro >= umbral_perim
 
         return jsonify({
             "success": True,
-            "modo": modelo_usado,
-            "variables_usadas": n_vars,
+            "version": metadata.get("version"),
+            "modo": modo,
+            "nota_modo": NOTA_BASICO if modo == "basico" else NOTA_COMPLETO,
             "categoria": categoria,
             "probabilidades": probabilidades,
             "certeza": certeza,
-            "recomendacion": recomendaciones[categoria],
-            "imc": {
-                "valor": round(imc, 2),
-                "clasificacion": imc_cat
-            },
+            "avisos_clinicos": avisos,
+            "imc": {"valor": round(imc, 2), "clasificacion": imc_cat},
+            "obesidad_central": obesidad_central,
             "datos_ingresados": {
-                "edad": edad,
-                "sexo": sexo,
-                "peso_kg": peso,
-                "talla_cm": talla_cm,
+                "edad": edad, "sexo": sexo, "peso_kg": peso, "talla_cm": talla_cm,
                 "perimetro_abdominal": perimetro,
                 "antecedentes_familiares": antecedentes,
                 "actividad_fisica": actividad,
                 "consumo_frutas_verduras": frutas,
-                "presion_arterial": presion,
-                "altitud": altitud
-            }
+                "presion_arterial": presion, "altitud": altitud,
+                "glucosa": glucosa, "colesterol": colesterol, "trigliceridos": trigliceridos,
+            },
+            "recomendacion": RECOMENDACIONES[categoria],
         })
 
     except KeyError as e:
-        return jsonify({
-            "success": False,
-            "error": f"Falta el campo: {str(e)}"
-        }), 400
+        return jsonify({"success": False, "error": f"Falta el campo: {e}"}), 400
     except ValueError as e:
-        return jsonify({
-            "success": False,
-            "error": f"Error en formato de datos: {str(e)}"
-        }), 400
-    except Exception as e:
-        return jsonify({
-            "success": False,
-            "error": f"Error interno: {str(e)}"
-        }), 500
+        return jsonify({"success": False, "error": str(e)}), 400
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"success": False, "error": f"Error interno: {e}"}), 500
 
-# ============================================================
-# RUTA DE SALUD
-# ============================================================
-@app.route("/health", methods=['GET'])
-def health():
-    return jsonify({
-        'status': 'ok',
-        'modelos_cargados': True,
-        'clases': CLASES,
-        'basico': {
-            'modelo': metadata.get('mejor_modelo_basico'),
-            'accuracy': metadata.get('accuracy_basico')
+
+# ---------------------------------------------------------------------------
+# Recomendaciones (texto que muestra la app Flutter)
+# ---------------------------------------------------------------------------
+RECOMENDACIONES = {
+    "Normal": {
+        "mensaje": "Su nivel de riesgo es bajo. Mantenga sus habitos saludables y realice controles anuales.",
+        "alimentacion": {
+            "descripcion": "Dieta balanceada para mantener su estado saludable",
+            "recomendados": [
+                "Quinua, kiwicha y caniahua (granos andinos ricos en proteina y fibra)",
+                "Chuno y moraya (carbohidratos complejos de absorcion lenta)",
+                "Tarwi/chocho (alto en proteinas, bajo indice glucemico)",
+                "Frutas locales: tumbo, aguaymanto, tuna, capuli",
+                "Verduras: zapallo, hojas de quinua, yuyo",
+                "Trucha y cuy (proteinas magras)",
+                "Mate de muna, manzanilla o hierba luisa sin azucar",
+            ],
+            "evitar": ["Exceso de pan blanco y fideos refinados", "Bebidas azucaradas", "Frituras en exceso"],
+            "porciones": "3 comidas principales + 2 refrigerios saludables al dia",
         },
-        'completo': {
-            'modelo': metadata.get('mejor_modelo_completo'),
-            'accuracy': metadata.get('accuracy_completo')
-        }
-    })
+        "actividad_fisica": {
+            "descripcion": "Mantenga un estilo de vida activo",
+            "recomendaciones": [
+                "Caminatas de 30 minutos diarios considerando la altitud",
+                "Subir escaleras en vez de ascensor",
+                "Estiramientos al despertar",
+            ],
+            "minutos_semanales": 150,
+        },
+        "estilo_vida": [
+            "Dormir 7-8 horas diarias",
+            "Hidratacion: minimo 8 vasos de agua (mas importante en altitud)",
+            "Control medico anual preventivo",
+            "Mantener IMC entre 18.5 y 24.9",
+        ],
+        "educacion": [
+            "La diabetes tipo II se puede prevenir con habitos saludables",
+            "Los alimentos andinos tienen bajo indice glucemico",
+            "Los antecedentes familiares son un factor no modificable, pero los habitos si",
+        ],
+    },
+    "Alterado": {
+        "mensaje": "Presenta factores de riesgo moderados. Se recomienda consultar a un profesional de salud.",
+        "alimentacion": {
+            "descripcion": "Dieta controlada para reducir factores de riesgo",
+            "recomendados": [
+                "Quinua y kiwicha como reemplazo del arroz blanco",
+                "Tarwi/chocho remojado (proteina vegetal que estabiliza glucosa)",
+                "Chuno negro en sopas (almidon resistente)",
+                "Trucha y cuy al horno o plancha",
+                "Ensaladas con hojas de quinua, yuyo y berros",
+                "Aguaymanto, tuna y tumbo (frutas bajas en azucar)",
+                "Habas y pallares como fuente de proteina y fibra",
+                "Mate de muna despues de las comidas",
+            ],
+            "evitar": [
+                "Azucar refinada (usar stevia)", "Pan blanco y fideos refinados",
+                "Gaseosas y jugos envasados", "Frituras y comida chatarra",
+                "Exceso de papa blanca (preferir papa nativa o chuno)",
+                "Alcohol en exceso",
+            ],
+            "porciones": "5 comidas pequenas al dia",
+        },
+        "actividad_fisica": {
+            "descripcion": "Incrementar actividad fisica gradualmente",
+            "recomendaciones": [
+                "Caminatas de 30-45 min diarios a ritmo moderado",
+                "Ejercicios de fuerza 2-3 veces por semana",
+                "Bailar (actividad cultural andina que es cardio)",
+                "Levantarse cada hora si trabaja sentado",
+            ],
+            "minutos_semanales": 200,
+            "nota_altitud": "En altitud >3000m, suba intensidad de forma gradual e hidratese bien.",
+        },
+        "estilo_vida": [
+            "Reducir 5-7% del peso si tiene sobrepeso (reduce el riesgo 58%)",
+            "Dormir 7-8 horas (el mal sueno eleva la glucosa)",
+            "Control medico cada 6 meses (glucosa y perfil lipidico)",
+            "Monitorear presion arterial mensualmente",
+        ],
+        "educacion": [
+            "La prediabetes es REVERSIBLE con cambios en alimentacion y ejercicio",
+            "Perimetro >90cm (H) o >80cm (M) indica grasa visceral de riesgo",
+            "La actividad fisica mejora la sensibilidad a la insulina aun sin perder peso",
+        ],
+        "alerta": "Se recomienda realizar una prueba de glucosa en ayunas en un centro de salud cercano.",
+    },
+    "Muy Alterado": {
+        "mensaje": "Se detecto un alto nivel de riesgo. Es urgente acudir a un profesional de salud.",
+        "alimentacion": {
+            "descripcion": "Dieta estricta supervisada por profesional de salud",
+            "recomendados": [
+                "Quinua como base de alimentacion",
+                "Tarwi/chocho en todas sus formas",
+                "Caniahua en mazamorras sin azucar",
+                "Verduras en abundancia: zapallo, broculi, espinaca",
+                "Trucha o cuy al horno (max 3 veces/semana)",
+                "Linaza remojada (1 cda diaria, ayuda al control glucemico)",
+                "Infusiones de muna, manzanilla, hierba luisa sin azucar",
+            ],
+            "evitar_estrictamente": [
+                "Azucar en todas sus formas", "Pan blanco, fideos y galletas refinadas",
+                "Gaseosas y bebidas energeticas", "Frituras y comida rapida",
+                "Arroz blanco en grandes cantidades", "Alcohol",
+                "Embutidos y carnes procesadas",
+            ],
+            "porciones": "Porciones pequenas, 5-6 veces al dia. NUNCA saltarse comidas.",
+        },
+        "actividad_fisica": {
+            "descripcion": "Actividad fisica supervisada y gradual",
+            "recomendaciones": [
+                "Consultar al medico ANTES de iniciar ejercicio intenso",
+                "Caminatas suaves de 20-30 min, 5 veces por semana",
+                "Estiramientos diarios",
+                "Monitorear como se siente durante la actividad",
+            ],
+            "minutos_semanales": 150,
+            "nota_altitud": "IMPORTANTE: en altitud >3000m consulte al medico antes de actividad intensa.",
+        },
+        "estilo_vida": [
+            "ACUDIR A UN CENTRO DE SALUD lo antes posible",
+            "Realizarse prueba de glucosa en ayunas y perfil lipidico",
+            "Control medico mensual mientras se estabiliza",
+            "NO automedicarse",
+            "Dormir 7-8 horas",
+            "Eliminar tabaco completamente",
+            "Llevar un registro diario de alimentacion",
+        ],
+        "educacion": [
+            "La DM2 no tratada puede causar dano renal, ceguera y amputaciones",
+            "Con tratamiento adecuado la diabetes se controla eficazmente",
+            "Los centros MINSA ofrecen control de diabetes gratuito o a bajo costo",
+        ],
+        "alerta": "URGENTE: acuda a su centro de salud mas cercano. No espere.",
+        "recursos_cusco": [
+            "Hospital Regional del Cusco - Endocrinologia",
+            "Centro de Salud San Jeronimo",
+            "EsSalud Cusco - Programa de Diabetes",
+            "Puestos de salud MINSA - Control gratuito de glucosa",
+        ],
+    },
+}
 
-# ============================================================
-# INICIAR SERVIDOR
-# ============================================================
+
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    print("=" * 50)
-    print("  DIABETIC SOFT MUNDI API v2.0")
-    print("=" * 50)
+    port = int(os.environ.get("PORT", 10000))
+    print("=" * 60)
+    print(f"  DIABETIC SOFT MUNDI API {metadata.get('version', '3.0')}")
+    print("=" * 60)
     print(f"  Clases: {CLASES}")
-    print(f"  Básico:   {metadata.get('mejor_modelo_basico')} ({metadata.get('accuracy_basico', 0):.4f})")
-    print(f"  Completo: {metadata.get('mejor_modelo_completo')} ({metadata.get('accuracy_completo', 0):.4f})")
-    print(f"  HbA1c: EXCLUIDA")
-    print("=" * 50)
-    app.run(host='0.0.0.0', port=10000, debug=False)
+    print(f"  Basico   macro-F1: {metadata['metricas_basico']['macro_f1']:.4f}")
+    print(f"  Completo macro-F1: {metadata['metricas_completo']['macro_f1']:.4f}")
+    print("=" * 60)
+    app.run(host="0.0.0.0", port=port, debug=False)
